@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Places Collector (Mock, Clickable Map)", layout="wide")
 
@@ -40,16 +41,17 @@ DEFAULT_INDUSTRIES = [
 ]
 
 # ----------------------------
-# DB
+# DB (mit Auto-Migration)
 # ----------------------------
 def ensure_db():
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
+
+    # Basistabelle (alt)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS places (
         place_id TEXT PRIMARY KEY,
         name TEXT,
-        industry TEXT,
         address TEXT,
         lat REAL,
         lng REAL,
@@ -61,6 +63,16 @@ def ensure_db():
         fetched_at TEXT
     );
     """)
+
+    # Migration: Spalten nachrüsten
+    cur.execute("PRAGMA table_info(places);")
+    cols = {row[1] for row in cur.fetchall()}
+
+    if "industry" not in cols:
+        cur.execute("ALTER TABLE places ADD COLUMN industry TEXT;")
+    if "has_website" not in cols:
+        cur.execute("ALTER TABLE places ADD COLUMN has_website INTEGER;")
+
     con.commit()
     return con
 
@@ -74,8 +86,8 @@ def upsert_place(con, row: dict):
     cur.execute("""
         INSERT INTO places (
             place_id, name, industry, address, lat, lng, types,
-            rating, user_ratings_total, phone, website, fetched_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            rating, user_ratings_total, phone, website, has_website, fetched_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(place_id) DO UPDATE SET
             name=excluded.name,
             industry=excluded.industry,
@@ -87,16 +99,26 @@ def upsert_place(con, row: dict):
             user_ratings_total=excluded.user_ratings_total,
             phone=excluded.phone,
             website=excluded.website,
+            has_website=excluded.has_website,
             fetched_at=excluded.fetched_at;
     """, (
-        row["place_id"], row["name"], row["industry"], row["address"], row["lat"], row["lng"],
-        row["types"], row["rating"], row["user_ratings_total"],
-        row["phone"], row["website"], row["fetched_at"]
+        row["place_id"], row["name"], row.get("industry"), row["address"],
+        row["lat"], row["lng"], row["types"],
+        row["rating"], row["user_ratings_total"],
+        row["phone"], row["website"], row["has_website"], row["fetched_at"]
     ))
     con.commit()
 
 def load_all(con) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT * FROM places ORDER BY fetched_at DESC", con)
+    df = pd.read_sql_query("SELECT * FROM places ORDER BY fetched_at DESC", con)
+    # falls alte Datensätze has_website NULL haben: nachberechnen
+    if "has_website" in df.columns:
+        df["has_website"] = df["has_website"].fillna(df["website"].notna().astype(int)).astype(int)
+    else:
+        df["has_website"] = df["website"].notna().astype(int)
+    if "industry" not in df.columns:
+        df["industry"] = None
+    return df
 
 # ----------------------------
 # Mock generation
@@ -106,7 +128,6 @@ def random_id(prefix="mock"):
     return f"{prefix}_{tail}"
 
 def jitter_latlng(center_lat, center_lng, radius_m):
-    # rough conversion: 1 deg lat ~ 111_000m; 1 deg lng scaled by cos(lat)
     r = radius_m * math.sqrt(random.random())
     theta = random.random() * 2 * math.pi
     dx = r * math.cos(theta)
@@ -115,7 +136,7 @@ def jitter_latlng(center_lat, center_lng, radius_m):
     dlng = dx / (111_000.0 * max(0.2, math.cos(math.radians(center_lat))))
     return center_lat + dlat, center_lng + dlng
 
-def mock_generate_places(location_label, center_lat, center_lng, radius_m, industries, n):
+def mock_generate_places(location_label, center_lat, center_lng, radius_m, industries, n, pct_with_website: int):
     type_pool = [
         "accounting", "restaurant", "electrician", "plumber", "real_estate_agency",
         "dentist", "lawyer", "hair_care", "gym", "store", "car_repair"
@@ -134,7 +155,11 @@ def mock_generate_places(location_label, center_lat, center_lng, radius_m, indus
         name = f"{industry} {random.choice(['Plus','Pro','Center','Studio','Service','Partner'])} {random.choice(suffix_pool)}"
         address = f"{random.choice(street_pool)} {random.randint(1, 220)}, {location_label}"
         phone = f"+43 316 {random.randint(100000, 999999)}"
-        website = f"https://{industry.lower().replace(' ', '-')}-{random.randint(10,999)}.example.com"
+
+        has_site = (random.randint(1, 100) <= pct_with_website)
+        website = None
+        if has_site:
+            website = f"https://{industry.lower().replace(' ', '-')}-{random.randint(10,999)}.example.com"
 
         rows.append({
             "place_id": random_id("mock"),
@@ -148,12 +173,12 @@ def mock_generate_places(location_label, center_lat, center_lng, radius_m, indus
             "user_ratings_total": ratings_total,
             "phone": phone,
             "website": website,
+            "has_website": 1 if has_site else 0,
             "fetched_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"
         })
     return rows
 
 def find_clicked_place(df: pd.DataFrame, lat: float, lng: float):
-    # match by rounded coords (Marker coords are the same we created)
     if df.empty:
         return None
     lat_r = round(lat, 6)
@@ -167,27 +192,38 @@ def find_clicked_place(df: pd.DataFrame, lat: float, lng: float):
     return hit.iloc[0].drop(["lat_r", "lng_r"])
 
 # ----------------------------
+# State
+# ----------------------------
+if "selected_place_id" not in st.session_state:
+    st.session_state.selected_place_id = None
+
+# ----------------------------
 # UI
 # ----------------------------
-st.title("Firmenfinder")
+st.title("Firmenliste UI (Simulation) – klickbare Karte + Website-Flag + Preview")
 
 con = ensure_db()
 
 with st.sidebar:
     st.header("Ort")
-    st.caption("Hier sind alle 9 Landeshauptstädte Österreichs:")
+    st.caption("Alle 9 Landeshauptstädte Österreichs:")
     capital = st.selectbox("Landeshauptstadt", list(CAPITALS_AT.keys()), index=list(CAPITALS_AT.keys()).index("Graz"))
     center_lat, center_lng = CAPITALS_AT[capital]
     location_label = f"{capital}, Austria"
 
     st.divider()
     st.header("Branchen")
-    industries = st.multiselect("Branchen auswählen", DEFAULT_INDUSTRIES, default=["Steuerberater", "Immobilienmakler", "Elektriker"])
+    industries = st.multiselect(
+        "Branchen auswählen",
+        DEFAULT_INDUSTRIES,
+        default=["Steuerberater", "Immobilienmakler", "Elektriker"]
+    )
 
     st.divider()
     st.header("Simulation")
     radius_m = st.slider("Radius (Meter)", 200, 5000, 2000, 100)
     n = st.slider("Anzahl Fake-Firmen", 5, 300, 80, 5)
+    pct_with_website = st.slider("Anteil mit Website (%)", 0, 100, 70, 5)
 
     colA, colB = st.columns(2)
     with colA:
@@ -196,55 +232,120 @@ with st.sidebar:
         clear_btn = st.button("DB leeren")
 
     st.divider()
+    st.header("Filter")
+    website_filter = st.radio(
+        "Website Filter",
+        ["Alle", "Nur mit Website", "Nur ohne Website"],
+        index=0
+    )
+
+    st.divider()
     st.write("DB-Datei:", DB_PATH)
 
 if clear_btn:
     clear_db(con)
+    st.session_state.selected_place_id = None
     st.success("DB geleert.")
 
 if gen_btn:
-    rows = mock_generate_places(location_label, center_lat, center_lng, radius_m, industries, n)
+    rows = mock_generate_places(location_label, center_lat, center_lng, radius_m, industries, n, pct_with_website)
     for r in rows:
         upsert_place(con, r)
     st.success(f"{len(rows)} Einträge simuliert und gespeichert.")
 
 df = load_all(con)
 
-left, right = st.columns([1.15, 0.85])
+# Apply website filter
+df_view = df.copy()
+if website_filter == "Nur mit Website":
+    df_view = df_view[df_view["has_website"] == 1]
+elif website_filter == "Nur ohne Website":
+    df_view = df_view[df_view["has_website"] == 0]
 
+# Search filter (global)
+st.divider()
+q = st.text_input("Suche in Name/Adresse/Branche/Types", value="")
+if q.strip():
+    ql = q.strip().lower()
+    df_view = df_view[
+        df_view["name"].fillna("").str.lower().str.contains(ql) |
+        df_view["address"].fillna("").str.lower().str.contains(ql) |
+        df_view["industry"].fillna("").str.lower().str.contains(ql) |
+        df_view["types"].fillna("").str.lower().str.contains(ql)
+    ]
+
+left, right = st.columns([1.2, 0.8])
+
+# ----------------------------
+# LEFT: table + website preview (unten links)
+# ----------------------------
 with left:
     st.subheader("Ergebnisse (DB)")
-    st.caption(f"Einträge: {len(df)}")
-    st.dataframe(df, use_container_width=True, height=520)
+    st.caption(f"Einträge (nach Filter): {len(df_view)} / Gesamt: {len(df)}")
 
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button("CSV herunterladen", data=csv, file_name="mock_places.csv", mime="text/csv")
+    show_cols = [
+        "name", "industry", "address", "rating", "user_ratings_total", "has_website", "website", "phone", "fetched_at"
+    ]
+    show_cols = [c for c in show_cols if c in df_view.columns]
+    st.dataframe(df_view[show_cols], use_container_width=True, height=420)
 
+    csv = df_view.to_csv(index=False).encode("utf-8")
+    st.download_button("CSV herunterladen", data=csv, file_name="places_filtered.csv", mime="text/csv")
+
+    st.divider()
+    st.subheader("Website Preview (links unten)")
+
+    selected = None
+    if st.session_state.selected_place_id:
+        hit = df[df["place_id"] == st.session_state.selected_place_id]
+        if len(hit) > 0:
+            selected = hit.iloc[0]
+
+    if selected is None:
+        st.info("Klicke rechts auf einen Marker, um Details + Preview zu sehen.")
+    else:
+        if selected.get("has_website", 0) == 1 and isinstance(selected.get("website"), str) and selected["website"]:
+            st.write(f"**Ausgewählt:** {selected['name']}")
+            st.write(f"**Website:** {selected['website']}")
+            # Iframe preview (kann von vielen Sites geblockt sein)
+            components.iframe(selected["website"], height=360, scrolling=True)
+            st.caption("Falls die Vorschau leer bleibt: die Website blockiert iFrame-Einbettung (CSP/X-Frame-Options).")
+        else:
+            st.write(f"**Ausgewählt:** {selected['name']}")
+            st.warning("Diese Firma hat keine Website (oder keine Website-Daten).")
+
+# ----------------------------
+# RIGHT: clickable map + details
+# ----------------------------
 with right:
     st.subheader("Karte (klickbare Marker)")
-    st.caption("Klicke einen Marker → Details werden darunter angezeigt.")
+    st.caption("Grün = hat Website | Rot = keine Website. Marker klicken → Details werden hier angezeigt + Preview links unten.")
 
-    if df.empty or df["lat"].isna().all() or df["lng"].isna().all():
-        st.info("Noch keine Daten. Links auf „Simulieren“ klicken.")
+    if df_view.empty or df_view["lat"].isna().all() or df_view["lng"].isna().all():
+        st.info("Keine Daten nach Filter. Links simulieren oder Filter anpassen.")
     else:
         m = folium.Map(location=[center_lat, center_lng], zoom_start=12, control_scale=True)
 
-        # Marker
-        for _, r in df.dropna(subset=["lat", "lng"]).iterrows():
-            tooltip = f"{r['name']} | ⭐ {r['rating']} ({r['user_ratings_total']})"
+        for _, r in df_view.dropna(subset=["lat", "lng"]).iterrows():
+            has_site = int(r.get("has_website", 0)) == 1
+            color = "green" if has_site else "red"
+
+            tooltip = f"{r['name']} | {'🌐' if has_site else '—'} | ⭐ {r['rating']} ({r['user_ratings_total']})"
             popup_html = f"""
             <div style="font-size: 14px;">
               <b>{r['name']}</b><br/>
-              Branche: {r['industry']}<br/>
+              Branche: {r.get('industry','')}<br/>
               {r['address']}<br/>
-              ⭐ {r['rating']} ({r['user_ratings_total']})<br/>
-              <small>Click marker → Details rechts</small>
+              Website: {"ja" if has_site else "nein"}<br/>
+              ⭐ {r['rating']} ({r['user_ratings_total']})
             </div>
             """
+
             folium.Marker(
                 location=[float(r["lat"]), float(r["lng"])],
                 tooltip=tooltip,
                 popup=folium.Popup(popup_html, max_width=350),
+                icon=folium.Icon(color=color),
             ).add_to(m)
 
         map_state = st_folium(m, width=None, height=520)
@@ -253,31 +354,24 @@ with right:
         st.divider()
 
         if clicked:
-            row = find_clicked_place(df, clicked["lat"], clicked["lng"])
+            row = find_clicked_place(df_view, clicked["lat"], clicked["lng"])
             if row is None:
                 st.warning("Klick erkannt, aber kein exakter Datensatz gefunden (Koordinaten-Match).")
             else:
+                st.session_state.selected_place_id = row["place_id"]
+
                 st.markdown("### Details")
                 st.write(f"**Name:** {row['name']}")
-                st.write(f"**Branche:** {row['industry']}")
+                st.write(f"**Branche:** {row.get('industry')}")
                 st.write(f"**Adresse:** {row['address']}")
                 st.write(f"**Rating:** {row['rating']}  | **Reviews:** {row['user_ratings_total']}")
-                st.write(f"**Telefon:** {row['phone']}")
-                st.write(f"**Website:** {row['website']}")
-                st.write(f"**Types:** {row['types']}")
-                st.write(f"**Fetched:** {row['fetched_at']}")
+                st.write(f"**Website vorhanden:** {'Ja' if int(row.get('has_website',0))==1 else 'Nein'}")
+                if row.get("website"):
+                    st.markdown(f"**Website:** [{row['website']}]({row['website']})")
+                else:
+                    st.write("**Website:** —")
+                st.write(f"**Telefon:** {row.get('phone')}")
+                st.write(f"**Types:** {row.get('types')}")
+                st.write(f"**Fetched:** {row.get('fetched_at')}")
         else:
             st.info("Noch kein Marker geklickt.")
-
-st.divider()
-st.subheader("Filter")
-q = st.text_input("Suche in Name/Adresse/Branche/Types", value="")
-if q.strip():
-    ql = q.strip().lower()
-    f = df[
-        df["name"].fillna("").str.lower().str.contains(ql) |
-        df["address"].fillna("").str.lower().str.contains(ql) |
-        df["industry"].fillna("").str.lower().str.contains(ql) |
-        df["types"].fillna("").str.lower().str.contains(ql)
-    ]
-    st.dataframe(f, use_container_width=True, height=320)
